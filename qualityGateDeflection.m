@@ -107,9 +107,13 @@ function [pass, qc] = qualityGateDeflection(results, openHeight_px, baseTag)
         qc.centerMax      = centerMax;
         qc.edgeExcess     = edgeExcess;
 
-        if isEdgePeak && maxDepth > 3 && edgeExcess > 3
-            qc.reasons{end+1} = sprintf('edge_peak (pos=%d/%d, excess=%.1fpx)', ...
-                maxPos, nValid, edgeExcess);
+        % Tolerance mirrors the upstream center-must-be-deepest rule
+        % (max(3, 15% of open height)); a hard 3 px here contradicted it
+        % and discarded near-full closures over 4-9 px plateau wobble.
+        edgeTolQC = max(3, 0.15 * openHeight_px);
+        if isEdgePeak && maxDepth > 3 && edgeExcess > edgeTolQC
+            qc.reasons{end+1} = sprintf('edge_peak (pos=%d/%d, excess=%.1fpx > %.1fpx)', ...
+                maxPos, nValid, edgeExcess, edgeTolQC);
         end
 
         %% CHECK 3b: PROFILE SYMMETRY

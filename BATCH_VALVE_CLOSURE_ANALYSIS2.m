@@ -708,8 +708,15 @@ for i = 1:N
                 'FontSize', 13, ...
                 'FontWeight', 'bold');
 
-            % exportgraphics is markedly faster than saveas (avoids the legacy print pipeline)
-            exportgraphics(fig, fullfile(pairDebugDir,[baseTag '_debug.png']), 'Resolution', 120);
+            % exportgraphics is markedly faster than saveas (avoids the legacy print pipeline).
+            % Guarded: a transient PNG write error (e.g. Dropbox briefly locking the
+            % file) must not discard an otherwise-successful measurement.
+            try
+                exportgraphics(fig, fullfile(pairDebugDir,[baseTag '_debug.png']), 'Resolution', 120);
+            catch MEfig
+                warning('Debug figure save failed for %s (%s). Measurement kept.', ...
+                    baseTag, MEfig.message);
+            end
             close(fig);
 
         end
@@ -896,6 +903,19 @@ if nDiscard > 0
     end
 end
 
+%% COMPLETION NOTIFICATION
+% Email via the ntfy.sh relay: no SMTP/account setup needed. Windows 10
+% ships curl.exe. (ntfy free tier rate-limits emails to a few per day,
+% which is fine for run-completion pings.)
+try
+    notifyMsg = sprintf('Valve batch complete: %d rows, %d OK (%d zero-reach), %d QC-discarded, %d failed.', ...
+        height(Tresults), nOK, nZero, nDiscard, nOtherFail + nSAMfail);
+    system(sprintf(['curl -s -H "Email: bopohob@gmail.com" -H "Title: BATCH_VALVE_CLOSURE done" ' ...
+        '-d "%s" https://ntfy.sh/rvoronov-valve-2026'], notifyMsg));
+    fprintf('\nCompletion email requested via ntfy.sh.\n');
+catch
+end
+
 % =========================================================================
 % LOCAL FUNCTIONS
 % =========================================================================
@@ -947,14 +967,36 @@ catch
     tformEstimate = affine2d(eye(3));
 end
 
-% Fix D: sanity clamp. Legitimate stage drift in these cutouts is a few px
-% at most; bogus imregcorr solutions (e.g., dx = -54 px seen in W80_ML1_R3)
-% corrupt the entire loss map. Reject oversized shifts and use identity.
+% Fix F: validate the estimated shift by RESIDUAL COMPARISON, not a blind
+% size clamp. Some pairs have genuinely large stage shifts (e.g. -54 px in
+% W80_ML1_R3) that imregcorr finds correctly; rejecting those misaligns the
+% pair, explodes the adaptive noise gate, and zeroes real closures. Keep the
+% transform only if it actually improves alignment over doing nothing.
 dxEst = tformEstimate.T(3,1);
 dyEst = tformEstimate.T(3,2);
-if abs(dxEst) > maxShift_px || abs(dyEst) > maxShift_px
-    warning('Registration shift (%.1f, %.1f) px exceeds limit of %.1f px. Using identity transform.', ...
-        dxEst, dyEst, maxShift_px);
+
+Rmov     = imref2d(size(moving));
+movReg   = imwarp(moving, tformEstimate, 'OutputView', Rmov);
+suppMask = imwarp(ones(size(moving), 'single'), tformEstimate, 'OutputView', Rmov) > 0.5;
+
+if nnz(suppMask) > 0.25 * numel(moving)
+    resReg = median(abs(fixed(suppMask) - movReg(suppMask)));
+    resId  = median(abs(fixed(suppMask) - moving(suppMask)));
+else
+    resReg = inf;   % transform pushed most of the image out of frame
+    resId  = 0;
+end
+
+if resReg < resId
+    if abs(dxEst) > maxShift_px || abs(dyEst) > maxShift_px
+        fprintf('  Registration: accepting large shift (%.1f, %.1f) px (residual %.4f < %.4f).\n', ...
+            dxEst, dyEst, resReg, resId);
+    end
+else
+    if abs(dxEst) > 0.5 || abs(dyEst) > 0.5
+        fprintf('  Registration: rejecting shift (%.1f, %.1f) px (residual %.4f >= %.4f). Using identity.\n', ...
+            dxEst, dyEst, resReg, resId);
+    end
     tformEstimate = affine2d(eye(3));
 end
 
