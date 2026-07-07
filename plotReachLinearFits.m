@@ -1,21 +1,32 @@
 function plotReachLinearFits(T, resultsFolder)
-% Linear fits of Membrane Reach (%) vs channel width per (H, ML) series,
-% restricted to the RISING (pre-saturation) regime:
+% Linear characterization of membrane deflection vs channel width, per
+% (H, ML) series, restricted to the RISING (pre-saturation) regime.
 %
-%   reach(W) ~ k * (W - W0)      k  = slope [% of open height / printer px]
-%                                W0 = onset width (x-intercept) [printer px]
+% Two complementary outputs:
+%
+% 1) reach_linear_fits.png -- normalized axes (reach % vs printer px),
+%    ONSET model:  reach ~ k_slope * (W - W0)
+%    k_slope [%/px] is the marginal rate once deflection has begun and W0
+%    [px] is the closure-onset width. Best for the manuscript (shows the
+%    onset physics).
+%
+% 2) reach_linear_fits_physical.png -- physical axes (sagitta s [um] vs
+%    membrane width C [um]), THROUGH-ORIGIN model:  s = k * C
+%    k is dimensionless (um/um) and directly usable in the design tool,
+%    which assumes s = kC. This k is the AVERAGE sag-per-width from zero,
+%    so thicker (stiffer) membranes give smaller k.
+%
+% Conversions (quantized-unit convention, Section 2.3 of the manuscript):
+%   C  = W_px * umPerPx          s = reach/100 * Hc,  Hc = H_layers * umPerLayer
 %
 % Rising regime = longest contiguous run of widths whose MEAN reach lies in
-% (riseMin, satMax). With <=9 width points per series, fixed physical
-% thresholds are more robust and reproducible than changepoint detection
-% (ischange/findchangepts move the breakpoint between noisy reruns).
-% Fits use replicate-level points, not means, so R^2 reflects real scatter.
-%
-% Outputs: reach_linear_fits.png/.pdf + reach_linear_fits.csv + console table.
+% (riseMin, satMax); replicate-level points are fitted, not means.
 
-riseMin = 3;     % mean reach (%) below this  = valve not yet closing
-satMax  = 85;    % mean reach (%) above this  = floor-contact saturation
-minPts  = 3;     % minimum number of widths required to fit
+riseMin    = 3;     % mean reach (%) below this  = valve not yet closing
+satMax     = 85;    % mean reach (%) above this  = floor-contact saturation
+minPts     = 3;     % minimum number of widths required to fit
+umPerPx    = 32;    % lateral printer-pixel pitch (um)
+umPerLayer = 50;    % vertical layer pitch (um)
 
 if ~exist(resultsFolder, 'dir')
     mkdir(resultsFolder);
@@ -46,12 +57,12 @@ nCombo    = height(comboKeys);
 cols = lines(max(nCombo, 3));
 markerList = {'o','s','^','d','v','>','<'};
 
-fig = figure('Position', [100 100 1200 700], 'Color', 'w', 'Visible', 'off');
-hold on
+figN = figure('Position', [100 100 1200 700], 'Color', 'w', 'Visible', 'off');  % normalized / onset
+figP = figure('Position', [100 100 1200 700], 'Color', 'w', 'Visible', 'off');  % physical / through-origin
 
-legH = [];
-legL = {};
-fitRows = [];   % accumulates CSV rows
+legHN = []; legLN = {};
+legHP = []; legLP = {};
+fitRows = [];
 
 fprintf('\n=== LINEAR REACH FITS (rising regime: %g%% < mean reach < %g%%) ===\n', ...
     riseMin, satMax);
@@ -59,6 +70,7 @@ fprintf('\n=== LINEAR REACH FITS (rising regime: %g%% < mean reach < %g%%) ===\n
 for c = 1:nCombo
     Hval  = comboKeys.Height_layers(c);
     MLval = comboKeys.MembraneLayers(c);
+    HcUm  = Hval * umPerLayer;   % nominal channel height in um
 
     subT = T_stats(T_stats.Height_layers == Hval & ...
                    T_stats.MembraneLayers == MLval, :);
@@ -81,8 +93,9 @@ for c = 1:nCombo
     col = cols(c, :);
     mk  = markerList{mod(c-1, numel(markerList))+1};
 
-    % Data: filled markers = used in fit, open markers = excluded (zero/saturated)
-    hData = errorbar(subT.Width_px(useIdx), meanR(useIdx), subT.SEM(useIdx), ...
+    % ---------- Normalized plot: data ----------
+    figure(figN); hold on
+    hDataN = errorbar(subT.Width_px(useIdx), meanR(useIdx), subT.SEM(useIdx), ...
         'LineStyle', 'none', 'Marker', mk, 'MarkerSize', 9, ...
         'Color', col, 'MarkerFaceColor', col, 'LineWidth', 1.5, 'CapSize', 5);
     errorbar(subT.Width_px(~useIdx), meanR(~useIdx), subT.SEM(~useIdx), ...
@@ -90,69 +103,119 @@ for c = 1:nCombo
         'Color', col, 'MarkerFaceColor', 'none', 'LineWidth', 1.0, ...
         'CapSize', 5, 'HandleVisibility', 'off');
 
-    kFit = NaN; W0 = NaN; R2 = NaN;
+    % ---------- Physical plot: data (means +- SEM, converted) ----------
+    Cmean = subT.Width_px * umPerPx;
+    Smean = meanR / 100 * HcUm;
+    Ssem  = subT.SEM  / 100 * HcUm;
+    figure(figP); hold on
+    hDataP = errorbar(Cmean(useIdx), Smean(useIdx), Ssem(useIdx), ...
+        'LineStyle', 'none', 'Marker', mk, 'MarkerSize', 9, ...
+        'Color', col, 'MarkerFaceColor', col, 'LineWidth', 1.5, 'CapSize', 5);
+    errorbar(Cmean(~useIdx), Smean(~useIdx), Ssem(~useIdx), ...
+        'LineStyle', 'none', 'Marker', mk, 'MarkerSize', 9, ...
+        'Color', col, 'MarkerFaceColor', 'none', 'LineWidth', 1.0, ...
+        'CapSize', 5, 'HandleVisibility', 'off');
+
+    kSlope = NaN; W0 = NaN; R2on = NaN;
+    kTool  = NaN; R2to = NaN;
     selW = subT.Width_px(useIdx);
 
     if numel(selW) >= minPts
-        % Fit on replicate-level points at the selected widths
         repMask = T_clean.Height_layers == Hval & ...
                   T_clean.MembraneLayers == MLval & ...
                   ismember(T_clean.Width_px, selW);
-        x = double(T_clean.Width_px(repMask));
-        y = double(T_clean.MaxDownwardReach_pct(repMask));
+        x = double(T_clean.Width_px(repMask));            % printer px
+        y = double(T_clean.MaxDownwardReach_pct(repMask));% % of height
 
+        % ----- Onset model on normalized axes: y = kSlope*(x - W0) -----
         p    = polyfit(x, y, 1);
         yhat = polyval(p, x);
         ssRes = sum((y - yhat).^2);
         ssTot = sum((y - mean(y)).^2);
-        if ssTot > 0, R2 = 1 - ssRes/ssTot; end
+        if ssTot > 0, R2on = 1 - ssRes/ssTot; end
+        kSlope = p(1);
+        W0     = -p(2) / p(1);
 
-        kFit = p(1);
-        W0   = -p(2) / p(1);
-
+        figure(figN);
         xLine = linspace(max(min(selW) - 15, W0), max(selW) + 8, 50);
         plot(xLine, polyval(p, xLine), '-', 'Color', col, ...
             'LineWidth', 2.0, 'HandleVisibility', 'off');
+        legLN{end+1} = sprintf('H=%d ML=%d: k=%.2f %%/px, W_0=%.0f px, R^2=%.2f', ...
+            Hval, MLval, kSlope, W0, R2on); %#ok<AGROW>
 
-        legL{end+1} = sprintf('H=%d ML=%d: k=%.2f %%/px, W_0=%.0f px, R^2=%.2f', ...
-            Hval, MLval, kFit, W0, R2); %#ok<AGROW>
+        % ----- Through-origin model on physical axes: s = kTool * C -----
+        Cr = x * umPerPx;              % um
+        Sr = y / 100 * HcUm;           % um
+        kTool = sum(Cr .* Sr) / sum(Cr.^2);
+        sHat  = kTool * Cr;
+        ssRes = sum((Sr - sHat).^2);
+        ssTot = sum((Sr - mean(Sr)).^2);
+        if ssTot > 0, R2to = 1 - ssRes/ssTot; end
+
+        figure(figP);
+        xLineC = linspace(0, max(Cr) * 1.08, 50);
+        plot(xLineC, kTool * xLineC, '-', 'Color', col, ...
+            'LineWidth', 2.0, 'HandleVisibility', 'off');
+        legLP{end+1} = sprintf('H=%d ML=%d: k=%.4f (s/C, dimensionless), R^2=%.2f', ...
+            Hval, MLval, kTool, R2to); %#ok<AGROW>
     else
-        legL{end+1} = sprintf('H=%d ML=%d: <%d rising pts, no fit', ...
-            Hval, MLval, minPts); %#ok<AGROW>
+        legLN{end+1} = sprintf('H=%d ML=%d: <%d rising pts, no fit', Hval, MLval, minPts); %#ok<AGROW>
+        legLP{end+1} = sprintf('H=%d ML=%d: <%d rising pts, no fit', Hval, MLval, minPts); %#ok<AGROW>
     end
-    legH(end+1) = hData; %#ok<AGROW>
 
-    fprintf('  H=%d ML=%d: k=%.3f %%/px | W0=%.1f px | R^2=%.3f | widths used: %s\n', ...
-        Hval, MLval, kFit, W0, R2, mat2str(selW(:)'));
+    legHN(end+1) = hDataN; %#ok<AGROW>
+    legHP(end+1) = hDataP; %#ok<AGROW>
 
-    fitRows = [fitRows; {Hval, MLval, kFit, W0, R2, numel(selW), ...
-        min([selW; NaN]), max([selW; NaN])}]; %#ok<AGROW>
+    fprintf('  H=%d ML=%d: k_slope=%.3f %%/px | W0=%.1f px | R2=%.3f || k_tool=%.4f (s/C) | R2=%.3f | widths: %s\n', ...
+        Hval, MLval, kSlope, W0, R2on, kTool, R2to, mat2str(selW(:)'));
+
+    fitRows = [fitRows; {Hval, MLval, kSlope, W0, R2on, kTool, R2to, ...
+        numel(selW), min([selW; NaN]), max([selW; NaN])}]; %#ok<AGROW>
 end
 
+% ---------- Finalize normalized (onset-model) figure ----------
+figure(figN);
 xlabel('Width (printer px, 1 px = 32 \mum)', 'FontSize', 16, 'FontWeight', 'bold');
 ylabel('Membrane Reach (% of Open Height)', 'FontSize', 16, 'FontWeight', 'bold');
-title({'Linear fits of reach vs width (pre-saturation regime)', ...
+title({'Onset-model fits: reach = k(W - W_0), pre-saturation regime', ...
     'filled = used in fit, open = excluded (below onset / saturated)'}, 'FontSize', 13);
 ylim([0 105]);
-grid on
-box on
+grid on; box on
 set(gca, 'FontSize', 14, 'LineWidth', 1);
-legend(legH, legL, 'Location', 'southeast', 'FontSize', 11);
+legend(legHN, legLN, 'Location', 'southeast', 'FontSize', 11);
 hold off
-
-exportgraphics(fig, fullfile(resultsFolder, 'reach_linear_fits.png'), 'Resolution', 200);
+exportgraphics(figN, fullfile(resultsFolder, 'reach_linear_fits.png'), 'Resolution', 200);
 try
-    exportgraphics(fig, fullfile(resultsFolder, 'reach_linear_fits.pdf'), ...
-        'ContentType', 'vector');
+    exportgraphics(figN, fullfile(resultsFolder, 'reach_linear_fits.pdf'), 'ContentType', 'vector');
 catch
 end
-close(fig);
+close(figN);
+
+% ---------- Finalize physical (through-origin) figure ----------
+figure(figP);
+xlabel(sprintf('Membrane width C (\\mum)  [C = W \\times %g \\mum/px]', umPerPx), ...
+    'FontSize', 16, 'FontWeight', 'bold');
+ylabel(sprintf('Sagitta s (\\mum)  [s = reach \\times H_c, H_c = layers \\times %g \\mum]', umPerLayer), ...
+    'FontSize', 16, 'FontWeight', 'bold');
+title({'Through-origin fits: s = kC (tool-compatible, k dimensionless)', ...
+    'filled = used in fit, open = excluded (below onset / saturated)'}, 'FontSize', 13);
+grid on; box on
+set(gca, 'FontSize', 14, 'LineWidth', 1);
+xlim([0, inf]); ylim([0, inf]);
+legend(legHP, legLP, 'Location', 'northwest', 'FontSize', 11);
+hold off
+exportgraphics(figP, fullfile(resultsFolder, 'reach_linear_fits_physical.png'), 'Resolution', 200);
+try
+    exportgraphics(figP, fullfile(resultsFolder, 'reach_linear_fits_physical.pdf'), 'ContentType', 'vector');
+catch
+end
+close(figP);
 
 Tfits = cell2table(fitRows, 'VariableNames', ...
-    {'Height_layers','MembraneLayers','k_pct_per_printerpx','W0_onset_px', ...
-     'R2','nWidthsUsed','W_used_min','W_used_max'});
+    {'Height_layers','MembraneLayers','k_slope_pct_per_px','W0_onset_px','R2_onset', ...
+     'k_tool_dimensionless','R2_throughOrigin','nWidthsUsed','W_used_min','W_used_max'});
 writetable(Tfits, fullfile(resultsFolder, 'reach_linear_fits.csv'));
 
-fprintf('Saved: reach_linear_fits.png / .csv\n');
+fprintf('Saved: reach_linear_fits(.png/.pdf), reach_linear_fits_physical(.png/.pdf), reach_linear_fits.csv\n');
 
 end
