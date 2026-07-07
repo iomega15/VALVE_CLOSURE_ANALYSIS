@@ -21,6 +21,20 @@ function [pass, qc] = qualityGateDeflection(results, openHeight_px, baseTag)
     qc.reasons = {};
 
     %% ================================================================
+    %  Genuine "no obstruction" is a valid ZERO measurement, not a
+    %  failure (see PHILOSOPHY above). Previously these fell through to
+    %  the R^2 / coverage checks (NaN R^2, 0% coverage) and were wrongly
+    %  discarded, so true zeros never reached the plots.
+    %  ================================================================
+    if isfield(results, 'reachMethod') && string(results.reachMethod) == "zero_no_obstruction"
+        qc.nFailures = 0;
+        qc.verdict   = "PASS";
+        pass         = true;
+        fprintf('    QC PASS [%s] (no obstruction -> zero reach)\n', baseTag);
+        return;
+    end
+
+    %% ================================================================
     %  CHECK 1: FIT QUALITY (R²)
     %  A good membrane shape should be well-described by arc or parabola.
     %  Negative R² means the fit is worse than a horizontal line.
@@ -74,12 +88,28 @@ function [pass, qc] = qualityGateDeflection(results, openHeight_px, baseTag)
 
         isEdgePeak = (maxPos <= edgePx) || (maxPos >= nValid - edgePx + 1);
 
+        % For plateau-like full closures the argmax lands at a random column
+        % (the profile is flat), so edge POSITION alone is not suspicious.
+        % Only flag if the edge peak is actually DEEPER than the central
+        % region by a meaningful margin (mirrors the center-must-be-deepest
+        % physics rule used upstream).
+        cSel = (1:nValid) >= round(0.30*nValid) & (1:nValid) <= round(0.70*nValid);
+        if any(cSel)
+            centerMax = max(depthVals(cSel));
+        else
+            centerMax = 0;
+        end
+        edgeExcess = maxDepth - centerMax;
+
         qc.peakPosition   = maxPos;
         qc.nValidCols     = nValid;
         qc.isEdgePeak     = isEdgePeak;
+        qc.centerMax      = centerMax;
+        qc.edgeExcess     = edgeExcess;
 
-        if isEdgePeak && maxDepth > 3   % only flag if nontrivial depth
-            qc.reasons{end+1} = sprintf('edge_peak (pos=%d/%d)', maxPos, nValid);
+        if isEdgePeak && maxDepth > 3 && edgeExcess > 3
+            qc.reasons{end+1} = sprintf('edge_peak (pos=%d/%d, excess=%.1fpx)', ...
+                maxPos, nValid, edgeExcess);
         end
 
         %% CHECK 3b: PROFILE SYMMETRY

@@ -1,10 +1,16 @@
 function plotCombinedClosureReach(T, resultsFolder)
+% Dual-axis closure plot: Area Obstructed (left) + Membrane Reach (right)
+% vs channel width. One line per (Height, MembraneLayers) series — the
+% dataset contains both H5 (ML1-3) and H10 (ML1), and mixing them into a
+% single line per ML produced vertical sawtooth artifacts.
+% Error bars = +/-1 SEM across replicates.
 
 if ~exist(resultsFolder, 'dir')
     mkdir(resultsFolder);
 end
 
 good = (strcmp(string(T.Notes), "OK") | ...
+    strcmp(string(T.Notes), "OK_parabola") | ...
     strcmp(string(T.Notes), "OK_zero_reach") | ...
     strcmp(string(T.Notes), "OK_reach_geom_fallback") | ...
     strcmp(string(T.Notes), "Incomplete pair -> assumed no closure")) ...
@@ -20,8 +26,8 @@ end
 T_clean.AreaObstructed_pct    = max(0, min(100, T_clean.AreaObstructed_pct));
 T_clean.MaxDownwardReach_pct  = max(0, min(100, T_clean.MaxDownwardReach_pct));
 
-groupVars = {'Width_px','MembraneLayers','Height_layers'};
-T_stats = groupsummary(T_clean, groupVars, 'mean', ...
+groupVars = {'Height_layers','MembraneLayers','Width_px'};
+T_stats = groupsummary(T_clean, groupVars, {'mean','std'}, ...
     {'AreaObstructed_pct','MaxDownwardReach_pct'});
 
 T_stats = T_stats(~isnan(T_stats.mean_AreaObstructed_pct) & ...
@@ -32,7 +38,14 @@ if isempty(T_stats) || height(T_stats) == 0
     return;
 end
 
-uniqueML = sort(unique(T_stats.MembraneLayers));
+T_stats.SEM_Area  = T_stats.std_AreaObstructed_pct   ./ sqrt(T_stats.GroupCount);
+T_stats.SEM_Reach = T_stats.std_MaxDownwardReach_pct ./ sqrt(T_stats.GroupCount);
+
+% One series per (Height, ML) combination present in the data
+comboKeys = unique(T_stats(:, {'Height_layers','MembraneLayers'}), 'rows');
+comboKeys = sortrows(comboKeys, {'Height_layers','MembraneLayers'});
+nCombo    = height(comboKeys);
+
 markerList = {'o','s','^','d','v','>','<','p','h'};
 lineStyles = {'-','--',':','-.'};
 
@@ -47,26 +60,28 @@ hold on
 legHandlesL = [];
 legLabelsL  = {};
 
-for m = 1:numel(uniqueML)
-    MLval = uniqueML(m);
-    subT = T_stats(T_stats.MembraneLayers == MLval, :);
+for c = 1:nCombo
+    Hval  = comboKeys.Height_layers(c);
+    MLval = comboKeys.MembraneLayers(c);
+    subT  = T_stats(T_stats.Height_layers == Hval & ...
+                    T_stats.MembraneLayers == MLval, :);
     if isempty(subT), continue; end
 
     [xData, si] = sort(subT.Width_px);
     yData = subT.mean_AreaObstructed_pct(si);
+    eData = subT.SEM_Area(si);
 
-    col = blueColors(mod(m-1, size(blueColors,1))+1, :);
-    mk  = markerList{mod(m-1, numel(markerList))+1};
-    ls  = lineStyles{mod(m-1, numel(lineStyles))+1};
+    col = blueColors(mod(c-1, size(blueColors,1))+1, :);
+    mk  = markerList{mod(c-1, numel(markerList))+1};
+    ls  = lineStyles{mod(c-1, numel(lineStyles))+1};
 
-    h = plot(xData, yData, ...
+    h = errorbar(xData, yData, eData, ...
         'LineStyle', ls, 'Marker', mk, ...
-        'LineWidth', 2.0, 'MarkerSize', 8, ...
+        'LineWidth', 2.0, 'MarkerSize', 8, 'CapSize', 5, ...
         'Color', col, 'MarkerFaceColor', col);
 
     legHandlesL(end+1) = h; %#ok<AGROW>
-    %legLabelsL{end+1}  = sprintf('Area Obstructed (ML=%d)', MLval); %#ok<AGROW>
-    legLabelsL{end+1}  = sprintf('Area Obstructed', MLval); %#ok<AGROW>
+    legLabelsL{end+1}  = sprintf('Area (H=%d, ML=%d)', Hval, MLval); %#ok<AGROW>
 end
 
 ylabel('Area Obstructed (%)', 'FontSize', 16, 'FontWeight', 'bold');
@@ -80,26 +95,28 @@ hold on
 legHandlesR = [];
 legLabelsR  = {};
 
-for m = 1:numel(uniqueML)
-    MLval = uniqueML(m);
-    subT = T_stats(T_stats.MembraneLayers == MLval, :);
+for c = 1:nCombo
+    Hval  = comboKeys.Height_layers(c);
+    MLval = comboKeys.MembraneLayers(c);
+    subT  = T_stats(T_stats.Height_layers == Hval & ...
+                    T_stats.MembraneLayers == MLval, :);
     if isempty(subT), continue; end
 
     [xData, si] = sort(subT.Width_px);
     yData = subT.mean_MaxDownwardReach_pct(si);
+    eData = subT.SEM_Reach(si);
 
-    col = redColors(mod(m-1, size(redColors,1))+1, :);
-    mk  = markerList{mod(m-1, numel(markerList))+1};
-    ls  = lineStyles{mod(m-1, numel(lineStyles))+1};
+    col = redColors(mod(c-1, size(redColors,1))+1, :);
+    mk  = markerList{mod(c-1, numel(markerList))+1};
+    ls  = lineStyles{mod(c-1, numel(lineStyles))+1};
 
-    h = plot(xData, yData, ...
+    h = errorbar(xData, yData, eData, ...
         'LineStyle', ls, 'Marker', mk, ...
-        'LineWidth', 2.0, 'MarkerSize', 8, ...
+        'LineWidth', 2.0, 'MarkerSize', 8, 'CapSize', 5, ...
         'Color', col, 'MarkerFaceColor', col);
 
     legHandlesR(end+1) = h; %#ok<AGROW>
-    %legLabelsR{end+1}  = sprintf('Membrane Reach (Mebrane Layers = %d)', MLval); %#ok<AGROW>
-    legLabelsR{end+1}  = sprintf('Membrane Reach', MLval); 
+    legLabelsR{end+1}  = sprintf('Reach (H=%d, ML=%d)', Hval, MLval); %#ok<AGROW>
 end
 
 ylabel('Membrane Reach (% of Open Height)', 'FontSize', 16, 'FontWeight', 'bold');
@@ -117,7 +134,7 @@ set(gca, 'FontSize', 16, 'LineWidth', 1);
 allHandles = [legHandlesL legHandlesR];
 allLabels  = [legLabelsL  legLabelsR];
 if ~isempty(allHandles)
-    legend(allHandles, allLabels, 'Location', 'best', 'Interpreter', 'none');
+    legend(allHandles, allLabels, 'Location', 'bestoutside', 'Interpreter', 'none');
 end
 
 exportgraphics(fig, fullfile(resultsFolder, 'closure_combined_dual_axis.png'), 'Resolution', 200);

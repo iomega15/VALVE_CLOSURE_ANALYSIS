@@ -49,6 +49,16 @@ cleanStartDeletesOldOutputs = true;
 closureMethod = 'MethodB_IntensityLoss';
 vizLevelFrac = 0.50;   % display-only contour level for debug overlay
 
+% --- Measurement robustness (Fixes A/B/D) ---
+mparams.noiseGateAbsMin = 0.05;  % absolute intensity-loss floor (0-1 gray scale)
+mparams.noiseGateFactor = 2.0;   % gate = max(AbsMin, Factor * outside-lumen 99th-pctile loss)
+mparams.minSignalFrac   = 0.02;  % >=2% of lumen pixels must exceed gate, else "no closure"
+mparams.strongFactor    = 2.0;   % "strong core" = loss > strongFactor * gate
+mparams.minStrongFrac   = 0.005; % >=0.5% of lumen must be strong-core (kills edge-glow strips)
+mparams.centerZoneFrac  = 0.40;  % central span fraction that must contain the deepest point
+mparams.edgeTolFrac     = 0.15;  % columns deeper than center by > this*openHeight are artifacts
+regShiftLimit_px        = 8;     % registration shifts larger than this are rejected (Fix D)
+
 % Explicit checkpoint path
 samCheckpointFile = fullfile(depDir, 'sam_vit_b_01ec64.pth');
 
@@ -98,6 +108,15 @@ for d = 1:numel(dirsToMake)
     if ~exist(dirsToMake{d}, 'dir')
         mkdir(dirsToMake{d});
     end
+end
+
+% SAM open-mask cache: lives OUTSIDE outputDir so clean starts never wipe it.
+% Reruns then skip SAM inference entirely (the expensive step) and only redo
+% the cheap Method-B math. Delete this folder manually to force re-segmentation
+% (e.g., after changing the SAM model or the roi).
+samMaskCacheDir = fullfile(inputDir, 'SAM_MASK_CACHE');
+if ~exist(samMaskCacheDir, 'dir')
+    mkdir(samMaskCacheDir);
 end
 
 %% CHECKPOINT INFO
@@ -258,7 +277,7 @@ end
 
 for i = 1:N
 
-    if Notes(i) == "OK" || Notes(i) == "OK_zero_reach" || ...
+    if Notes(i) == "OK" || Notes(i) == "OK_parabola" || Notes(i) == "OK_zero_reach" || ...
             Notes(i) == "OK_reach_geom_fallback" || contains(Notes(i), "Incomplete pair")
         fprintf('\n[%d/%d] Skipping cached/completed row.\n', i, N);
         continue;
@@ -349,11 +368,31 @@ for i = 1:N
 
         % -------------------------------------------------------------
         % OPEN SEGMENTATION (SAM only; no fallback)
+        % Cached masks are reused so threshold/fit iterations skip SAM.
         % -------------------------------------------------------------
+        maskCacheFile = fullfile(samMaskCacheDir, [baseTag '_openmask.mat']);
+        gotCachedMask = false;
+        if exist(maskCacheFile, 'file')
+            try
+                Smask  = load(maskCacheFile, 'BWopen', 'qOpen');
+                BWopen = Smask.BWopen;
+                qOpen  = Smask.qOpen;
+                gotCachedMask = true;
+                fprintf('Loaded cached SAM open mask.\n');
+            catch
+                gotCachedMask = false;
+            end
+        end
+
+        if ~gotCachedMask
         fprintf('Running SAM on OPEN image...\n');
 
         try
             [BWopen, qOpen] = segmentLumenSAM2(Iopen, roi, samDebugArg, [baseTag '_OP']);
+            try
+                save(maskCacheFile, 'BWopen', 'qOpen', '-v7.3');
+            catch
+            end
         catch ME
             warning('SAM failed on OPEN image: %s', ME.message);
             fprintf('Skipping pair %s (no open lumen segmentation)\n', baseTag);
@@ -388,6 +427,7 @@ for i = 1:N
             save(pairCacheFile, 'pairResult', '-v7.3');
             continue
         end
+        end   % ~gotCachedMask
 
         if isempty(BWopen) || ~any(BWopen(:)) || ~qOpen.lumen_valid
             warning('SAM returned invalid/empty open lumen mask for %s', baseTag);
@@ -444,7 +484,7 @@ for i = 1:N
         % REGISTER CLOSED TO OPEN
         % -------------------------------------------------------------
         if doRegistration
-            [IclosedReg, tform] = registerClosedToOpen(Iopen, Iclosed, roi);
+            [IclosedReg, tform] = registerClosedToOpen(Iopen, Iclosed, roi, regShiftLimit_px);
             Registration_dx_px(i) = tform.T(3,1);
             Registration_dy_px(i) = tform.T(3,2);
         else
@@ -463,7 +503,7 @@ for i = 1:N
         IopenGray      = im2double(rgb2gray(Iopen));
         IclosedGrayReg = im2double(rgb2gray(IclosedReg));
 
-        results = computeClosureMetrics_MethodB(IopenGray, IclosedGrayReg, BWopen, vizLevelFrac);
+        results = computeClosureMetrics_MethodB(IopenGray, IclosedGrayReg, BWopen, vizLevelFrac, mparams);
 
         %% ============================================================
         %  QUALITY GATE — decide if this measurement is trustworthy
@@ -532,7 +572,9 @@ for i = 1:N
             imagesc(results.lossMap);
             axis image off;
             colorbar;
-            title('Loss map');
+            title(sprintf('Loss map (gate=%.3f, sig=%.1f%%, strong=%.1f%%%s)', ...
+                results.noiseGate, 100*results.signalFrac, 100*results.strongFrac, ...
+                ternary_local(results.noClosureByGate, ', GATED->0', '')));
 
             subplot(2,3,4);
             imshow(IclosedReg);
@@ -556,7 +598,14 @@ for i = 1:N
                 vCols = find(~isnan(results.frontSmooth));
                 plot(vCols, results.frontSmooth(vCols), 'c-', 'LineWidth', 1.5);
             end
-            title(sprintf('Physical obstruction (thresh=%.3f)', results.computeThresh));
+            % Selected fit (arc/parabola) in image coordinates: row = baseline + depth
+            if any(~isnan(results.fitY)) && ~isnan(results.baselineY)
+                fitCols = find(~isnan(results.fitY));
+                plot(fitCols, results.baselineY + results.fitY(fitCols), ...
+                    'y-', 'LineWidth', 2.0);
+            end
+            title(sprintf('Physical obstruction (thresh=%.3f) | yellow = selected fit', ...
+                results.computeThresh));
             hold off;
 
 
@@ -638,8 +687,9 @@ for i = 1:N
                 arcInfo = '';
             end
 
-            title(sprintf('Obstr=%.1f%% | Reach=%.1f%% | %s%s', ...
+            title(sprintf('Obstr=%.1f%% (mask %.1f%%) | Reach=%.1f%% | %s%s', ...
                 results.areaObstructed_pct, ...
+                results.areaObstructedMask_pct, ...
                 results.reach_pct, ...
                 char(results.reachMethod), ...
                 arcInfo));
@@ -714,6 +764,7 @@ Tresults = buildResultsTable(Tpairs, ...
 
 %% GROUP STATS OVER REPLICATES
 valid = strcmp(Tresults.Notes, "OK") | ...
+    strcmp(Tresults.Notes, "OK_parabola") | ...
     strcmp(Tresults.Notes, "OK_zero_reach") | ...
     strcmp(Tresults.Notes, "OK_reach_geom_fallback") | ...
     strcmp(Tresults.Notes, "Incomplete pair -> assumed no closure");
@@ -785,6 +836,7 @@ fprintf('\n=== PROCESSING COMPLETE ===\n');
 fprintf('Total rows: %d\n', height(Tresults));
 fprintf('OK rows:    %d\n', ...
     sum(strcmp(Tresults.Notes, "OK")) + ...
+    sum(strcmp(Tresults.Notes, "OK_parabola")) + ...
     sum(strcmp(Tresults.Notes, "OK_zero_reach")) + ...
     sum(strcmp(Tresults.Notes, "OK_reach_geom_fallback")));
 fprintf('Incomplete: %d\n', sum(strcmp(Tresults.Notes, "Incomplete pair -> assumed no closure")));
@@ -869,7 +921,11 @@ meta.R     = str2double(tok{4});
 meta.State = upper(tok{5});
 end
 
-function [IclosedReg, tform] = registerClosedToOpen(IopenRGB, IclosedRGB, roi)
+function [IclosedReg, tform] = registerClosedToOpen(IopenRGB, IclosedRGB, roi, maxShift_px)
+
+if nargin < 4 || isempty(maxShift_px)
+    maxShift_px = 8;
+end
 
 IopenGray = rgb2gray(ensureRGB_local(IopenRGB));
 IclosedGray = rgb2gray(ensureRGB_local(IclosedRGB));
@@ -888,6 +944,17 @@ try
     tformEstimate = imregcorr(moving, fixed, 'translation');
 catch
     warning('imregcorr failed. Proceeding without registration.');
+    tformEstimate = affine2d(eye(3));
+end
+
+% Fix D: sanity clamp. Legitimate stage drift in these cutouts is a few px
+% at most; bogus imregcorr solutions (e.g., dx = -54 px seen in W80_ML1_R3)
+% corrupt the entire loss map. Reject oversized shifts and use identity.
+dxEst = tformEstimate.T(3,1);
+dyEst = tformEstimate.T(3,2);
+if abs(dxEst) > maxShift_px || abs(dyEst) > maxShift_px
+    warning('Registration shift (%.1f, %.1f) px exceeds limit of %.1f px. Using identity transform.', ...
+        dxEst, dyEst, maxShift_px);
     tformEstimate = affine2d(eye(3));
 end
 
@@ -916,6 +983,14 @@ if ndims(I) == 2
     Irgb = repmat(I, [1 1 3]);
 else
     Irgb = I;
+end
+end
+
+function out = ternary_local(cond, a, b)
+if cond
+    out = a;
+else
+    out = b;
 end
 end
 
@@ -978,6 +1053,7 @@ if ~exist(resultsFolder, 'dir')
 end
 
 good = (strcmp(string(T.Notes), "OK") | ...
+    strcmp(string(T.Notes), "OK_parabola") | ...
     strcmp(string(T.Notes), "OK_zero_reach") | ...
     strcmp(string(T.Notes), "OK_reach_geom_fallback") | ...
     strcmp(string(T.Notes), "Incomplete pair -> assumed no closure")) ...
@@ -1241,7 +1317,13 @@ catch
 end
 end
 
-function results = computeClosureMetrics_MethodB(IopenGray, IclosedGrayReg, BWopen, vizLevelFrac)
+function results = computeClosureMetrics_MethodB(IopenGray, IclosedGrayReg, BWopen, vizLevelFrac, mp)
+
+if nargin < 5 || isempty(mp)
+    mp = struct('noiseGateAbsMin', 0.05, 'noiseGateFactor', 2.0, ...
+        'minSignalFrac', 0.02, 'strongFactor', 2.0, 'minStrongFrac', 0.005, ...
+        'centerZoneFrac', 0.40, 'edgeTolFrac', 0.15);
+end
 
 BWopen = logical(BWopen);
 [nRows, nCols] = size(BWopen);
@@ -1268,16 +1350,53 @@ openHeight_px   = median(openHeightByCol);
 openArea_px     = nnz(BWopen);
 
 %% COMPUTE INTENSITY LOSS MAP
-lossMap = IopenGray - IclosedGrayReg;
-lossMap(lossMap < 0) = 0;
-lossMap(~BWopen)     = 0;
+rawLoss = IopenGray - IclosedGrayReg;
+rawLoss(rawLoss < 0) = 0;
+
+lossMap = rawLoss;
+lossMap(~BWopen) = 0;
+
+%% ================================================================
+%  FIX A: ABSOLUTE NOISE GATE
+%  Estimate the noise level of the open-vs-closed difference from a
+%  reference region OUTSIDE the lumen (same rows, laterally away from
+%  it), where nothing physical changes between the two images. This
+%  self-calibrates against JPEG noise, layer-line striations, and
+%  registration jitter. If the loss inside the lumen does not clearly
+%  exceed that noise level, the valve did not close: report a genuine
+%  zero instead of normalizing noise up to full scale (the root cause
+%  of the 0% -> 98% false positives on non-closing valves).
+%  ================================================================
+lumenRowBand = false(nRows, nCols);
+lumenRowBand(any(BWopen, 2), :) = true;
+guardMask = imdilate(BWopen, strel('disk', 15));
+refMask   = lumenRowBand & ~guardMask;
+
+refVals = sort(rawLoss(refMask));
+if isempty(refVals)
+    noiseRef = 0;
+else
+    noiseRef = refVals(max(1, round(0.99 * numel(refVals))));   % 99th percentile
+end
+
+noiseGate  = max(mp.noiseGateAbsMin, mp.noiseGateFactor * noiseRef);
+
+lumenLoss  = lossMap(BWopen);
+signalFrac = nnz(lumenLoss > noiseGate) / max(1, nnz(BWopen));
+strongFrac = nnz(lumenLoss > mp.strongFactor * noiseGate) / max(1, nnz(BWopen));
+
+% No-closure decision needs BOTH a minimum detected fraction AND a "strong
+% core" well above the gate. Edge-glow strips (thin bands of marginal loss
+% along the blurred bright top edge of the lumen) can span >10% of the
+% lumen yet have almost no pixels well above the gate, whereas a real
+% membrane always produces a strong-loss core.
+noClosureByGate = (signalFrac < mp.minSignalFrac) || (strongFrac < mp.minStrongFrac);
 
 maxLoss = max(lossMap(:));
-if maxLoss > 0
-    lossMapNorm = lossMap / maxLoss;
-else
-    lossMapNorm = zeros(size(lossMap));
-end
+
+% Normalize against at least the noise gate so a pure-noise loss map is
+% NOT stretched to full 0-1 scale.
+lossMapNorm = lossMap / max(maxLoss, noiseGate);
 
 %% ADAPTIVE THRESHOLD
 lossInsideLumen = lossMapNorm(BWopen);
@@ -1290,7 +1409,11 @@ else
 end
 
 %% RAW DETECTION MASK
-rawDetect = BWopen & (lossMapNorm >= computeThresh);
+if noClosureByGate
+    rawDetect = false(nRows, nCols);   % Fix A: below noise floor -> no detection
+else
+    rawDetect = BWopen & (lossMapNorm >= computeThresh);
+end
 
 %% PHYSICALLY-INFORMED OBSTRUCTION MASK
 [rowIdx, colIdx] = find(rawDetect);
@@ -1367,10 +1490,11 @@ obstructionMaskCompute = obstructionMaskCompute & BWopen;
 %% DISPLAY MASK = COMPUTE MASK
 obstructionMaskDisplay = obstructionMaskCompute;
 
-%% AREA METRICS
+%% AREA METRICS (mask-based; overridden by fit-based area when a fit is selected)
 obstructedArea_px       = nnz(obstructionMaskCompute);
 areaObstructed_pct      = 100 * obstructedArea_px / openArea_px;
 closedAreaEquivalent_px = openArea_px - obstructedArea_px;
+areaObstructedMask_pct  = areaObstructed_pct;   % kept for diagnostics
 
 %% EXTRACT BOTTOM EDGE (full width, for visualization)
 frontBottom = nan(1, nCols);
@@ -1435,8 +1559,20 @@ frontSmooth(obsCols) = fullBottomSmooth;
 %% TRIMMED SPAN FOR REACH MEASUREMENT
 trimmedObsCols = obsCols(obsCols >= spanLeft & obsCols <= spanRight);
 
-if numel(trimmedObsCols) < 5
-    trimmedObsCols = obsCols;
+% Fix B: do NOT fall back to untrimmed columns. Wall-adjacent columns are
+% dominated by registration shear / edge artifacts (they were the source of
+% the single-column edge spikes). If nothing is detected inside the span,
+% there is no measurable membrane reach.
+if isempty(trimmedObsCols)
+    maxReach_px       = 0;
+    reach_pct         = 0;
+    reachCurve_px(:)  = 0;
+    reachX            = NaN;
+    reachY            = 0;
+    fitValid          = false;
+    reachMethod       = "zero_no_obstruction";
+    results           = packResults();
+    return;
 end
 
 %% BASELINE FROM OPEN-LUMEN TOP AT SPAN EDGES
@@ -1453,6 +1589,32 @@ bottomSmooth  = movmedian(bottomProfile, windowSize);
 
 %% DEPTH RELATIVE TO BASELINE
 depthProfile = bottomSmooth - baselineY;
+
+%% ================================================================
+%  FIX B: EDGE/OUTLIER SUPPRESSION
+%  Physics: the membrane is anchored at the walls and sags downward,
+%  so its deepest point must lie in (or plateau through) the center
+%  of the span. Any column significantly deeper than the central
+%  region is an artifact (registration shear at the walls, debris)
+%  and is excluded from the reach measurement and the fits.
+%  ================================================================
+spanW_fit = spanRight - spanLeft;
+cLo = spanLeft + (0.5 - mp.centerZoneFrac/2) * spanW_fit;
+cHi = spanLeft + (0.5 + mp.centerZoneFrac/2) * spanW_fit;
+centerSel = (xRange >= cLo) & (xRange <= cHi);
+
+if any(centerSel)
+    centerDepth = max(depthProfile(centerSel));
+else
+    centerDepth = 0;   % nothing detected centrally -> nothing can be deeper
+end
+
+edgeTol = max(3, mp.edgeTolFrac * openHeight_px);
+artifactCols = depthProfile > (centerDepth + edgeTol);
+if any(artifactCols)
+    depthProfile(artifactCols) = NaN;
+end
+
 reachCurve_px(xRange) = depthProfile;
 
 %% GEOMETRIC MAX (always available as ultimate fallback)
@@ -1487,10 +1649,11 @@ end
     depthFullSpan = zeros(1, length(xFullSpan));
 
     % Fill in measured depths where obstruction was detected
+    % (columns suppressed as artifacts by Fix B stay at zero)
     for k = 1:length(xRange)
         col = xRange(k);
         idx = col - xL + 1;   % index into xFullSpan
-        if idx >= 1 && idx <= length(depthFullSpan)
+        if ~isnan(depthProfile(k)) && idx >= 1 && idx <= length(depthFullSpan)
             depthFullSpan(idx) = depthProfile(k);
         end
     end
@@ -1647,6 +1810,21 @@ else
     fprintf('    Geometric fallback: max=%.1f px\n', geomMax);
 end
 
+%% AREA FROM SELECTED FIT
+%  Consistent with the fit-based reach and immune to sub-membrane floor
+%  fill and debris that inflate the mask-based area. Caveat: for genuine
+%  full touchdowns the membrane flattens along the floor, so the arc
+%  slightly underestimates area there (mask value kept as diagnostic).
+if fitValid
+    fitColsA = find(~isnan(fitY));
+    if ~isempty(fitColsA)
+        fitDepthsA = min(max(fitY(fitColsA), 0), openHeight_px);
+        obstructedArea_px       = sum(fitDepthsA);
+        areaObstructed_pct      = min(100, 100 * obstructedArea_px / openArea_px);
+        closedAreaEquivalent_px = openArea_px - obstructedArea_px;
+    end
+end
+
 %% CLAMP REACH TO PHYSICALLY REASONABLE BOUNDS
 maxReach_px = max(0, min(maxReach_px, openHeight_px));
 reach_pct   = max(0, min(reach_pct, 100));
@@ -1662,7 +1840,14 @@ results = packResults();
         out.lossMap                 = lossMapNorm;
         out.computeThresh           = computeThresh;
 
+        % Fix A diagnostics
+        out.noiseGate               = noiseGate;
+        out.signalFrac              = signalFrac;
+        out.strongFrac              = strongFrac;
+        out.noClosureByGate         = noClosureByGate;
+
         out.areaObstructed_pct      = areaObstructed_pct;
+        out.areaObstructedMask_pct  = areaObstructedMask_pct;
         out.reach_pct               = reach_pct;
         out.maxReach_px             = maxReach_px;
         out.reachCurve_px           = reachCurve_px;
