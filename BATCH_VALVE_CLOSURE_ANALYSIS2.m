@@ -572,8 +572,9 @@ for i = 1:N
             imagesc(results.lossMap);
             axis image off;
             colorbar;
-            title(sprintf('Loss map (gate=%.3f, sig=%.1f%%, strong=%.1f%%%s)', ...
-                results.noiseGate, 100*results.signalFrac, 100*results.strongFrac, ...
+            title(sprintf('Loss map (gate=%.3f [p99=%.2f med=%.2f], sig=%.1f%%, strong=%.1f%%%s)', ...
+                results.noiseGate, results.refP99, results.refMed, ...
+                100*results.signalFrac, 100*results.strongFrac, ...
                 ternary_local(results.noClosureByGate, ', GATED->0', '')));
 
             subplot(2,3,4);
@@ -1009,26 +1010,25 @@ movReg   = imwarp(moving, tformEstimate, 'OutputView', Rmov);
 suppMask = imwarp(ones(size(moving), 'single'), tformEstimate, 'OutputView', Rmov) > 0.5;
 
 if nnz(suppMask) > 0.25 * numel(moving)
-    % Median-centered residuals: a global exposure offset between the two
-    % captures must not mask (or fake) an alignment improvement.
-    dReg = fixed(suppMask) - movReg(suppMask);
-    dId  = fixed(suppMask) - moving(suppMask);
-    resReg = median(abs(dReg - median(dReg)));
-    resId  = median(abs(dId  - median(dId)));
+    % Normalized cross-correlation: gain/offset-invariant AND sensitive to
+    % structural alignment. (A median-residual test proved nearly blind to
+    % horizontal shifts because the layer striations are horizontal.)
+    corrReg = corr2(fixed(suppMask), movReg(suppMask));
+    corrId  = corr2(fixed(suppMask), moving(suppMask));
 else
-    resReg = inf;   % transform pushed most of the image out of frame
-    resId  = 0;
+    corrReg = -inf;   % transform pushed most of the image out of frame
+    corrId  = inf;
 end
 
-if resReg < resId
+if corrReg > corrId
     if abs(dxEst) > maxShift_px || abs(dyEst) > maxShift_px
-        fprintf('  Registration: accepting large shift (%.1f, %.1f) px (residual %.4f < %.4f).\n', ...
-            dxEst, dyEst, resReg, resId);
+        fprintf('  Registration: accepting large shift (%.1f, %.1f) px (NCC %.4f > %.4f).\n', ...
+            dxEst, dyEst, corrReg, corrId);
     end
 else
     if abs(dxEst) > 0.5 || abs(dyEst) > 0.5
-        fprintf('  Registration: rejecting shift (%.1f, %.1f) px (residual %.4f >= %.4f). Using identity.\n', ...
-            dxEst, dyEst, resReg, resId);
+        fprintf('  Registration: rejecting shift (%.1f, %.1f) px (NCC %.4f <= %.4f). Using identity.\n', ...
+            dxEst, dyEst, corrReg, corrId);
     end
     tformEstimate = affine2d(eye(3));
 end
@@ -1468,11 +1468,21 @@ lossMap(~BWopen) = 0;
 %  zero instead of normalizing noise up to full scale (the root cause
 %  of the 0% -> 98% false positives on non-closing valves).
 %  ================================================================
-refVals = sort(rawLoss(refMask));
+refVals = rawLoss(refMask);
+refVals = refVals(:);
 if isempty(refVals)
-    noiseRef = 0;
+    noiseRef = 0; refP99 = 0; refMed = 0;
 else
-    noiseRef = refVals(max(1, round(0.99 * numel(refVals))));   % 99th percentile
+    v      = sort(refVals);
+    refP99 = v(max(1, round(0.99 * numel(v))));
+    refMed = v(max(1, round(0.50 * numel(v))));
+    refMAD = median(abs(refVals - refMed));
+    % Robust scale: on strongly pressurized devices the structure AROUND the
+    % lumen deforms too, polluting the far tail (p99) of the reference and
+    % inflating the gate until real closures are zeroed. Deformed pixels are
+    % a tail minority, so median + 5*MAD tracks the true noise floor; for
+    % healthy pairs the two estimates nearly coincide.
+    noiseRef = min(refP99, refMed + 5 * refMAD);
 end
 
 noiseGate  = max(mp.noiseGateAbsMin, mp.noiseGateFactor * noiseRef);
@@ -1938,6 +1948,8 @@ results = packResults();
 
         % Fix A diagnostics
         out.noiseGate               = noiseGate;
+        out.refP99                  = refP99;
+        out.refMed                  = refMed;
         out.signalFrac              = signalFrac;
         out.strongFrac              = strongFrac;
         out.noClosureByGate         = noClosureByGate;
