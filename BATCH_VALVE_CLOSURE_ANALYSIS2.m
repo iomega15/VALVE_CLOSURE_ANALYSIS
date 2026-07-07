@@ -511,6 +511,17 @@ for i = 1:N
         %  ============================================================
         [qcPass, qcInfo] = qualityGateDeflection(results, results.openHeight_px, baseTag);
 
+        % Inconsistent image pair (gated despite massive coherent signal):
+        % discard the replicate rather than record a false zero.
+        if isfield(results, 'inconsistentPair') && results.inconsistentPair
+            qcPass = false;
+            qcInfo.nFailures = 1;
+            qcInfo.verdict   = sprintf('FAIL: inconsistent_pair (gate=%.3f, sig=%.0f%%)', ...
+                results.noiseGate, 100*results.signalFrac);
+            fprintf('    DISCARDED: inconsistent pair (gate=%.3f, sig=%.0f%%)\n', ...
+                results.noiseGate, 100*results.signalFrac);
+        end
+
         if qcPass
             % --- Trusted measurement ---
             OpenArea_px(i)           = results.openArea_px;
@@ -1505,6 +1516,13 @@ strongFrac = nnz(lumenLoss > mp.strongFactor * noiseGate) / max(1, nnz(BWopen));
 % membrane always produces a strong-loss core.
 noClosureByGate = (signalFrac < mp.minSignalFrac) || (strongFrac < mp.minStrongFrac);
 
+% A gated pair with a LARGE coherent in-lumen signal is not a credible
+% zero: it is an inconsistent image pair (bulk illumination / deformation
+% mismatch that inflates the reference noise beyond repair, e.g.
+% H5_W70_ML2_R2 with rsig ~10x normal). Flag it so the batch discards the
+% replicate (NaN) instead of recording a false zero that biases the mean.
+inconsistentPair = noClosureByGate && (signalFrac >= 0.20);
+
 maxLoss = max(lossMap(:));
 
 % Normalize against at least the noise gate so a pure-noise loss map is
@@ -1619,6 +1637,14 @@ areaObstructedMask_pct  = areaObstructed_pct;   % kept for diagnostics
 %  through strong-loss pixels. Genuine full touchdowns keep strong loss
 %  all the way down and are unaffected.
 strongFront = cleanMask & (lossMapNorm >= mp.frontStrongFrac);
+
+% Consolidate: on weak-signal pairs the membrane body fragments at this
+% threshold (noise straddles the cutoff), producing jagged fronts that
+% break the arc fit and cause needless QC discards (seen at H10_W90 R2/R3).
+% Morphological closing bridges the speckle without materially extending
+% the front (radius ~5% of channel height).
+seFront = strel('disk', max(2, round(0.05 * openHeight_px)));
+strongFront = imclose(strongFront, seFront) & cleanMask;
 
 frontBottom = nan(1, nCols);
 
@@ -1970,6 +1996,7 @@ results = packResults();
         out.signalFrac              = signalFrac;
         out.strongFrac              = strongFrac;
         out.noClosureByGate         = noClosureByGate;
+        out.inconsistentPair        = inconsistentPair;
 
         out.areaObstructed_pct      = areaObstructed_pct;
         out.areaObstructedMask_pct  = areaObstructedMask_pct;
