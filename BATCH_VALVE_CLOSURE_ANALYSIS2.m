@@ -57,6 +57,7 @@ mparams.strongFactor    = 2.0;   % "strong core" = loss > strongFactor * gate
 mparams.minStrongFrac   = 0.005; % >=0.5% of lumen must be strong-core (kills edge-glow strips)
 mparams.centerZoneFrac  = 0.40;  % central span fraction that must contain the deepest point
 mparams.edgeTolFrac     = 0.15;  % columns deeper than center by > this*openHeight are artifacts
+mparams.frontStrongFrac = 0.5;   % reach front traced only through loss >= this frac of peak (Fix C)
 regShiftLimit_px        = 8;     % registration shifts larger than this are rejected (Fix D)
 
 % Explicit checkpoint path
@@ -572,8 +573,8 @@ for i = 1:N
             imagesc(results.lossMap);
             axis image off;
             colorbar;
-            title(sprintf('Loss map (gate=%.3f [p99=%.2f med=%.2f], sig=%.1f%%, strong=%.1f%%%s)', ...
-                results.noiseGate, results.refP99, results.refMed, ...
+            title(sprintf('Loss map (gate=%.3f [p99=%.2f rsig=%.3f], sig=%.1f%%, strong=%.1f%%%s)', ...
+                results.noiseGate, results.refP99, results.refSig, ...
                 100*results.signalFrac, 100*results.strongFrac, ...
                 ternary_local(results.noClosureByGate, ', GATED->0', '')));
 
@@ -1397,7 +1398,7 @@ function results = computeClosureMetrics_MethodB(IopenGray, IclosedGrayReg, BWop
 if nargin < 5 || isempty(mp)
     mp = struct('noiseGateAbsMin', 0.05, 'noiseGateFactor', 2.0, ...
         'minSignalFrac', 0.02, 'strongFactor', 2.0, 'minStrongFrac', 0.005, ...
-        'centerZoneFrac', 0.40, 'edgeTolFrac', 0.15);
+        'centerZoneFrac', 0.40, 'edgeTolFrac', 0.15, 'frontStrongFrac', 0.5);
 end
 
 BWopen = logical(BWopen);
@@ -1468,21 +1469,27 @@ lossMap(~BWopen) = 0;
 %  zero instead of normalizing noise up to full scale (the root cause
 %  of the 0% -> 98% false positives on non-closing valves).
 %  ================================================================
-refVals = rawLoss(refMask);
-refVals = refVals(:);
-if isempty(refVals)
-    noiseRef = 0; refP99 = 0; refMed = 0;
+% Noise scale from the SIGNED difference (before positive clipping): for a
+% well-matched pair the signed residual is ~zero-mean noise, and a robust
+% MAD-based sigma ignores the heavy tail produced by pressure-induced
+% deformation around the lumen (H10 devices). 2.33*sigma is the Gaussian
+% equivalent of the positive-tail p99, so healthy pairs get the same gate
+% as the original p99 estimator while deformed pairs no longer explode.
+% NOTE: never gate on statistics of the positive-CLIPPED loss -- its median
+% is ~0 for matched pairs, which collapses MAD-based estimates to the
+% absolute floor and resurrects the empty-lumen false positives
+% (observed at W20_ML2_R1: gate hit 0.05 while p99 was 0.10).
+refDiff = IopenGray - IclosedGrayReg;
+refD    = refDiff(refMask);
+refD    = refD(:);
+lossRef = rawLoss(refMask);
+if isempty(refD)
+    noiseRef = 0; refP99 = 0; refSig = 0;
 else
-    v      = sort(refVals);
-    refP99 = v(max(1, round(0.99 * numel(v))));
-    refMed = v(max(1, round(0.50 * numel(v))));
-    refMAD = median(abs(refVals - refMed));
-    % Robust scale: on strongly pressurized devices the structure AROUND the
-    % lumen deforms too, polluting the far tail (p99) of the reference and
-    % inflating the gate until real closures are zeroed. Deformed pixels are
-    % a tail minority, so median + 5*MAD tracks the true noise floor; for
-    % healthy pairs the two estimates nearly coincide.
-    noiseRef = min(refP99, refMed + 5 * refMAD);
+    vv     = sort(lossRef(:));
+    refP99 = vv(max(1, round(0.99 * numel(vv))));   % diagnostic only
+    refSig = 1.4826 * median(abs(refD - median(refD)));
+    noiseRef = 2.33 * refSig;
 end
 
 noiseGate  = max(mp.noiseGateAbsMin, mp.noiseGateFactor * noiseRef);
@@ -1602,11 +1609,21 @@ areaObstructed_pct      = 100 * obstructedArea_px / openArea_px;
 closedAreaEquivalent_px = openArea_px - obstructedArea_px;
 areaObstructedMask_pct  = areaObstructed_pct;   % kept for diagnostics
 
-%% EXTRACT BOTTOM EDGE (full width, for visualization)
+%% EXTRACT BOTTOM EDGE OF THE MEMBRANE (Fix C: strong-loss front)
+%  The permissive detection mask (and its flood fill) extends below the
+%  membrane apex through the dark "pinch" gap between membrane and floor,
+%  dragging the front to the channel floor and inflating reach toward 100%
+%  (e.g. H10_W90_ML1_R1: mask 99.5% while the apex was mid-lumen). The
+%  membrane BODY always carries the strongest intensity loss -- the loss
+%  map is normalized to its peak -- so the reach front is traced only
+%  through strong-loss pixels. Genuine full touchdowns keep strong loss
+%  all the way down and are unaffected.
+strongFront = cleanMask & (lossMapNorm >= mp.frontStrongFrac);
+
 frontBottom = nan(1, nCols);
 
 for c = 1:nCols
-    rows = find(obstructionMaskCompute(:, c));
+    rows = find(strongFront(:, c));
     if ~isempty(rows)
         frontBottom(c) = max(rows);
     end
@@ -1949,7 +1966,7 @@ results = packResults();
         % Fix A diagnostics
         out.noiseGate               = noiseGate;
         out.refP99                  = refP99;
-        out.refMed                  = refMed;
+        out.refSig                  = refSig;
         out.signalFrac              = signalFrac;
         out.strongFrac              = strongFrac;
         out.noClosureByGate         = noClosureByGate;
