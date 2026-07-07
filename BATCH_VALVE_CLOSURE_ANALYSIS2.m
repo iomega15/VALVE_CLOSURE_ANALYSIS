@@ -839,6 +839,13 @@ catch ME
     warning('Combined dual-axis plot failed: %s', ME.message);
 end
 
+%% LINEAR k-FITS OF REACH VS WIDTH (pre-saturation regime, per H/ML series)
+try
+    plotReachLinearFits(Tresults, outputDir);
+catch ME
+    warning('Reach linear fits failed: %s', ME.message);
+end
+
 fprintf('\n=== PROCESSING COMPLETE ===\n');
 fprintf('Total rows: %d\n', height(Tresults));
 fprintf('OK rows:    %d\n', ...
@@ -904,16 +911,38 @@ if nDiscard > 0
 end
 
 %% COMPLETION NOTIFICATION
-% Email via the ntfy.sh relay: no SMTP/account setup needed. Windows 10
-% ships curl.exe. (ntfy free tier rate-limits emails to a few per day,
-% which is fine for run-completion pings.)
+% Preferred: direct email via Gmail SMTP. One-time setup on the machine that
+% runs the batch: create an App Password at
+%   https://myaccount.google.com/apppasswords   (requires 2-Step Verification)
+% and save it (just the 16 characters) into:
+%   %USERPROFILE%\gmail_app_password.txt
+% The file stays local to that machine (NOT in Dropbox/git). If the file is
+% missing, falls back to an anonymous ntfy.sh push: watch the topic at
+% https://ntfy.sh/rvoronov-valve-2026 in any browser tab or the ntfy app.
+notifyAddr = 'bopohob@gmail.com';
+notifyMsg  = sprintf('Valve batch complete: %d rows, %d OK (%d zero-reach), %d QC-discarded, %d failed.', ...
+    height(Tresults), nOK, nZero, nDiscard, nOtherFail + nSAMfail);
+
 try
-    notifyMsg = sprintf('Valve batch complete: %d rows, %d OK (%d zero-reach), %d QC-discarded, %d failed.', ...
-        height(Tresults), nOK, nZero, nDiscard, nOtherFail + nSAMfail);
-    system(sprintf(['curl -s -H "Email: bopohob@gmail.com" -H "Title: BATCH_VALVE_CLOSURE done" ' ...
-        '-d "%s" https://ntfy.sh/rvoronov-valve-2026'], notifyMsg));
-    fprintf('\nCompletion email requested via ntfy.sh.\n');
-catch
+    pwFile = fullfile(getenv('USERPROFILE'), 'gmail_app_password.txt');
+    if exist(pwFile, 'file')
+        gmailAppPassword = strtrim(fileread(pwFile));
+        setpref('Internet', 'SMTP_Server',   'smtp.gmail.com');
+        setpref('Internet', 'E_mail',        notifyAddr);
+        setpref('Internet', 'SMTP_Username', notifyAddr);
+        setpref('Internet', 'SMTP_Password', gmailAppPassword);
+        props = java.lang.System.getProperties;
+        props.setProperty('mail.smtp.auth', 'true');
+        props.setProperty('mail.smtp.socketFactory.port', '465');
+        props.setProperty('mail.smtp.socketFactory.class', 'javax.net.ssl.SSLSocketFactory');
+        sendmail(notifyAddr, 'BATCH_VALVE_CLOSURE done', notifyMsg);
+        fprintf('\nCompletion email sent to %s.\n', notifyAddr);
+    else
+        system(sprintf('curl -s -d "%s" https://ntfy.sh/rvoronov-valve-2026', notifyMsg));
+        fprintf('\nNo %s found -> push sent to https://ntfy.sh/rvoronov-valve-2026 instead.\n', pwFile);
+    end
+catch MEnotify
+    warning('Completion notification failed: %s', MEnotify.message);
 end
 
 % =========================================================================
@@ -980,8 +1009,12 @@ movReg   = imwarp(moving, tformEstimate, 'OutputView', Rmov);
 suppMask = imwarp(ones(size(moving), 'single'), tformEstimate, 'OutputView', Rmov) > 0.5;
 
 if nnz(suppMask) > 0.25 * numel(moving)
-    resReg = median(abs(fixed(suppMask) - movReg(suppMask)));
-    resId  = median(abs(fixed(suppMask) - moving(suppMask)));
+    % Median-centered residuals: a global exposure offset between the two
+    % captures must not mask (or fake) an alignment improvement.
+    dReg = fixed(suppMask) - movReg(suppMask);
+    dId  = fixed(suppMask) - moving(suppMask);
+    resReg = median(abs(dReg - median(dReg)));
+    resId  = median(abs(dId  - median(dId)));
 else
     resReg = inf;   % transform pushed most of the image out of frame
     resId  = 0;
@@ -1391,6 +1424,33 @@ openHeightByCol = openBottom(validCols) - openTop(validCols) + 1;
 openHeight_px   = median(openHeightByCol);
 openArea_px     = nnz(BWopen);
 
+%% REFERENCE REGION (static: same rows as the lumen, laterally away from it)
+lumenRowBand = false(nRows, nCols);
+lumenRowBand(any(BWopen, 2), :) = true;
+guardMask = imdilate(BWopen, strel('disk', 15));
+refMask   = lumenRowBand & ~guardMask;
+
+%% ================================================================
+%  FIX G: PHOTOMETRIC NORMALIZATION
+%  Some pairs have a global illumination/exposure difference between
+%  the open and closed captures. That inflates the difference image
+%  everywhere, drives the adaptive gate sky-high (observed gate=0.45
+%  vs typical 0.05-0.13), and real closures get zeroed. Map the closed
+%  image into the open image's photometric frame using a robust linear
+%  fit over the static reference region before differencing.
+%  ================================================================
+if nnz(refMask) > 100
+    xPh = double(IclosedGrayReg(refMask));
+    yPh = double(IopenGray(refMask));
+    pPh = polyfit(xPh, yPh, 1);
+    if pPh(1) > 0.5 && pPh(1) < 2
+        IclosedGrayReg = pPh(1) * IclosedGrayReg + pPh(2);
+    else
+        % implausible gain -> offset-only correction
+        IclosedGrayReg = IclosedGrayReg + (median(yPh) - median(xPh));
+    end
+end
+
 %% COMPUTE INTENSITY LOSS MAP
 rawLoss = IopenGray - IclosedGrayReg;
 rawLoss(rawLoss < 0) = 0;
@@ -1400,20 +1460,14 @@ lossMap(~BWopen) = 0;
 
 %% ================================================================
 %  FIX A: ABSOLUTE NOISE GATE
-%  Estimate the noise level of the open-vs-closed difference from a
-%  reference region OUTSIDE the lumen (same rows, laterally away from
-%  it), where nothing physical changes between the two images. This
+%  Estimate the noise level of the (photometrically corrected)
+%  open-vs-closed difference from the static reference region. This
 %  self-calibrates against JPEG noise, layer-line striations, and
 %  registration jitter. If the loss inside the lumen does not clearly
 %  exceed that noise level, the valve did not close: report a genuine
 %  zero instead of normalizing noise up to full scale (the root cause
 %  of the 0% -> 98% false positives on non-closing valves).
 %  ================================================================
-lumenRowBand = false(nRows, nCols);
-lumenRowBand(any(BWopen, 2), :) = true;
-guardMask = imdilate(BWopen, strel('disk', 15));
-refMask   = lumenRowBand & ~guardMask;
-
 refVals = sort(rawLoss(refMask));
 if isempty(refVals)
     noiseRef = 0;

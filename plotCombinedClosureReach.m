@@ -1,8 +1,7 @@
 function plotCombinedClosureReach(T, resultsFolder)
-% Dual-axis closure plot: Area Obstructed (left) + Membrane Reach (right)
-% vs channel width. One line per (Height, MembraneLayers) series — the
-% dataset contains both H5 (ML1-3) and H10 (ML1), and mixing them into a
-% single line per ML produced vertical sawtooth artifacts.
+% Dual-axis closure plots: Area Obstructed (left) + Membrane Reach (right)
+% vs channel width, one line per (Height, MembraneLayers) series.
+% Emits the all-series figure plus one figure per ML value.
 % Error bars = +/-1 SEM across replicates.
 
 if ~exist(resultsFolder, 'dir')
@@ -41,19 +40,38 @@ end
 T_stats.SEM_Area  = T_stats.std_AreaObstructed_pct   ./ sqrt(T_stats.GroupCount);
 T_stats.SEM_Reach = T_stats.std_MaxDownwardReach_pct ./ sqrt(T_stats.GroupCount);
 
-% One series per (Height, ML) combination present in the data
 comboKeys = unique(T_stats(:, {'Height_layers','MembraneLayers'}), 'rows');
 comboKeys = sortrows(comboKeys, {'Height_layers','MembraneLayers'});
-nCombo    = height(comboKeys);
+
+% All series in one figure
+makeDualAxisPlot(T_stats, comboKeys, resultsFolder, 'closure_combined_dual_axis');
+
+% One figure per ML value (all heights that have that ML)
+uniqueML = unique(comboKeys.MembraneLayers);
+for m = 1:numel(uniqueML)
+    MLval = uniqueML(m);
+    subKeys = comboKeys(comboKeys.MembraneLayers == MLval, :);
+    makeDualAxisPlot(T_stats, subKeys, resultsFolder, ...
+        sprintf('closure_combined_ML%d', MLval));
+end
+
+end
+
+% =========================================================================
+function makeDualAxisPlot(T_stats, comboKeys, resultsFolder, fileTag)
+
+nCombo = height(comboKeys);
+if nCombo == 0
+    return;
+end
 
 markerList = {'o','s','^','d','v','>','<','p','h'};
 lineStyles = {'-','--',':','-.'};
 
-% Colors: blue family for area, red family for reach
 blueColors = [0.0 0.2 0.6; 0.2 0.4 0.8; 0.4 0.6 1.0; 0.1 0.3 0.7];
 redColors  = [0.8 0.1 0.1; 1.0 0.3 0.2; 0.9 0.5 0.3; 0.7 0.0 0.0];
 
-fig = figure('Position', [100 100 1200 700], 'Color', 'w');
+fig = figure('Position', [100 100 1200 700], 'Color', 'w', 'Visible', 'off');
 
 yyaxis left
 hold on
@@ -137,13 +155,14 @@ if ~isempty(allHandles)
     legend(allHandles, allLabels, 'Location', 'bestoutside', 'Interpreter', 'none');
 end
 
-exportgraphics(fig, fullfile(resultsFolder, 'closure_combined_dual_axis.png'), 'Resolution', 200);
+exportgraphics(fig, fullfile(resultsFolder, [fileTag '.png']), 'Resolution', 200);
 try
-    exportgraphics(fig, fullfile(resultsFolder, 'closure_combined_dual_axis.pdf'), ...
+    exportgraphics(fig, fullfile(resultsFolder, [fileTag '.pdf']), ...
         'ContentType', 'vector');
 catch
 end
+close(fig);
 
-fprintf('Saved: closure_combined_dual_axis.png\n');
+fprintf('Saved: %s.png\n', fileTag);
 
 end
