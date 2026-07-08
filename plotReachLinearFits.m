@@ -40,6 +40,11 @@ good = (strcmp(string(T.Notes), "OK") | ...
     & ~isnan(T.MaxDownwardReach_pct);
 
 T_clean = T(good, :);
+% Bound at the printability upper limit: beyond ~120 printer px the channel
+% roof pre-sags and reach has no valid open-state baseline (see
+% plotCombinedClosureReach). These widths are excluded from the k fits too.
+maxWidth_px = 120;
+T_clean = T_clean(T_clean.Width_px <= maxWidth_px, :);
 if isempty(T_clean)
     warning('No valid rows for linear fits. Skipping.');
     return;

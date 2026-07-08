@@ -17,6 +17,15 @@ good = (strcmp(string(T.Notes), "OK") | ...
 
 T_clean = T(good, :);
 
+% Bound the closure analysis at the printability upper limit (Stage I,
+% ~120 printer px / 3800 um for NanoClear). Beyond this the channel roof
+% pre-sags, so the "open" lumen is already collapsed and membrane reach has
+% no valid open-state baseline (e.g. H5_W150 measures ~0 reach because the
+% open and closed cross-sections are indistinguishable). Change or set to
+% Inf to include all widths.
+maxWidth_px = 120;
+T_clean = T_clean(T_clean.Width_px <= maxWidth_px, :);
+
 if isempty(T_clean) || height(T_clean) == 0
     warning('No valid rows for combined plot. Skipping.');
     return;
