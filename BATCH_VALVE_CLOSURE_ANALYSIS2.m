@@ -921,6 +921,15 @@ if nDiscard > 0
             Tresults.Replicate(idx), ...
             string(Tresults.Notes(idx)));
     end
+
+    % Re-imaging worklist: these pairs could not be measured reliably.
+    % Re-image them (matched illumination/focus, no stage move between the
+    % open and closed shots) and rerun; cached SAM masks make reruns fast.
+    Tredo = Tresults(discIdx, {'Height_layers','Width_px','MembraneLayers','Replicate', ...
+        'OpenFile','ClosedFile','Notes'});
+    redoFile = fullfile(outputDir, 'discarded_reimage_worklist.csv');
+    writetable(Tredo, redoFile);
+    fprintf('\n  Re-imaging worklist (%d pairs) saved to:\n  %s\n', height(Tredo), redoFile);
 end
 
 %% COMPLETION NOTIFICATION
