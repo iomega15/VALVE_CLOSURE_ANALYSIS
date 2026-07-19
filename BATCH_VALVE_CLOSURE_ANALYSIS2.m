@@ -149,7 +149,9 @@ parsed = struct( ...
     'MembraneLayers', [], ...
     'Replicate', [], ...
     'State', [], ...
-    'ExpDate', [] );
+    'ExpDate', [], ...
+    'RedoRank', [], ...
+    'DateKey', [] );
 
 P = repmat(parsed, numel(fileNames), 1);
 
@@ -167,6 +169,8 @@ for i = 1:numel(fileNames)
     P(i).Replicate       = meta.R;
     P(i).State           = meta.State;
     P(i).ExpDate         = meta.Date;   % '' if undated (legacy), MMDDYY if present
+    P(i).RedoRank        = meta.Redo;   % 0 = original, N = _redoN re-image
+    P(i).DateKey         = mmddyyToSortKey(meta.Date);  % chronological sort key, 0 if undated
 end
 
 validRows = ~isnan([P.Height_layers])' & ...
@@ -183,6 +187,35 @@ end
 
 %% BUILD FILE TABLE
 Tfiles = struct2table(P);
+
+%% REDO DE-DUPLICATION
+% If a re-imaged file is present for the same H/W/ML/R/State (a *_redo[N]
+% file, and/or a newer _MMDDYY date), keep only the best one so the student
+% can drop the redo in beside the rejected original and rerun WITHOUT having
+% to delete the bad file. Priority: highest redo rank, then newest date.
+if height(Tfiles) > 0
+    keyStr = strcat(string(Tfiles.Height_layers), "_", string(Tfiles.Width_px), ...
+        "_", string(Tfiles.MembraneLayers), "_", string(Tfiles.Replicate), ...
+        "_", string(Tfiles.State));
+    [uKeys, ~, grp] = unique(keyStr, 'stable');
+    keepMask = true(height(Tfiles), 1);
+    for g = 1:numel(uKeys)
+        idx = find(grp == g);
+        if numel(idx) <= 1, continue; end
+        [~, order] = sortrows([Tfiles.RedoRank(idx), Tfiles.DateKey(idx)], [-1 -2]);
+        winner = idx(order(1));
+        losers = idx(order(2:end));
+        keepMask(losers) = false;
+        for L = losers(:)'
+            fprintf('  Superseded (redo/newer wins): %s  ->  using %s\n', ...
+                Tfiles.File{L}, Tfiles.File{winner});
+        end
+    end
+    if any(~keepMask)
+        fprintf('  Redo de-duplication: dropped %d superseded file(s).\n', sum(~keepMask));
+        Tfiles = Tfiles(keepMask, :);
+    end
+end
 
 %% SPLIT OPEN / CLOSED
 isOpen   = strcmpi(Tfiles.State, 'OP');
@@ -911,27 +944,59 @@ fprintf('  SAM failures:           %d\n', nSAMfail);
 fprintf('  Other failures:         %d\n', nOtherFail);
 fprintf('  Total:                  %d\n', height(Tresults));
 
-if nDiscard > 0
-    fprintf('\n  Discarded cases:\n');
-    discIdx = find(startsWith(string(Tresults.Notes), "QC_DISCARD"));
-    for k = 1:numel(discIdx)
-        idx = discIdx(k);
-        fprintf('    H%d_W%d_ML%d_R%d: %s\n', ...
-            Tresults.Height_layers(idx), ...
-            Tresults.Width_px(idx), ...
-            Tresults.MembraneLayers(idx), ...
-            Tresults.Replicate(idx), ...
-            string(Tresults.Notes(idx)));
+% =========================================================================
+% STUDENT RE-IMAGE TASK LIST
+% Every pair that could not be trusted (QC discard, SAM failure, incomplete
+% pair, or other failure -- i.e. anything whose Notes do not start with "OK")
+% is listed for re-imaging, together with the EXACT filename the student
+% should give each redo so that (a) it is recognisable as a redo and (b) the
+% pipeline automatically uses it in place of the rejected original on the
+% next run (via the redo de-duplication above -- no need to delete the bad
+% file). Re-image BOTH the open and closed shots with matched illumination
+% and focus, and do NOT move the stage between them.
+% =========================================================================
+needsRedo = ~startsWith(string(Tresults.Notes), "OK");
+redoIdx   = find(needsRedo);
+
+if ~isempty(redoIdx)
+    fprintf('\n=== STUDENT RE-IMAGE TASK LIST (%d pair(s)) ===\n', numel(redoIdx));
+    fprintf('  Save the redo images into:\n    %s\n', inputDir);
+    fprintf('  Re-image BOTH open (OP) and closed (CL); matched illumination/focus; no stage move between shots.\n');
+    fprintf('  Replace <MMDDYY> with the date you re-image (e.g. %s). The _redo tag is what makes\n', datestr(now,'mmddyy'));
+    fprintf('  the pipeline prefer the new file; leave the rejected original in place and just rerun.\n\n');
+
+    redoOpen   = strings(numel(redoIdx),1);
+    redoClosed = strings(numel(redoIdx),1);
+    reasonStr  = strings(numel(redoIdx),1);
+    for k = 1:numel(redoIdx)
+        idx = redoIdx(k);
+        H  = Tresults.Height_layers(idx);  W  = Tresults.Width_px(idx);
+        ML = Tresults.MembraneLayers(idx); R  = Tresults.Replicate(idx);
+        % Base condition tag; bump the redo counter past whatever already exists.
+        existing = '';
+        if ismember('OpenFile', Tresults.Properties.VariableNames) && ~isempty(Tresults.OpenFile{idx})
+            existing = Tresults.OpenFile{idx};
+        elseif ismember('ClosedFile', Tresults.Properties.VariableNames) && ~isempty(Tresults.ClosedFile{idx})
+            existing = Tresults.ClosedFile{idx};
+        end
+        suf = nextRedoSuffix(existing);
+        base = sprintf('Cutouts_H%d_W%d_ML%d_R%d', H, W, ML, R);
+        redoOpen(k)   = sprintf('%s_OP_<MMDDYY>%s.jpg', base, suf);
+        redoClosed(k) = sprintf('%s_CL_<MMDDYY>%s.jpg', base, suf);
+        reasonStr(k)  = string(Tresults.Notes(idx));
+        fprintf('  [%2d] H%d_W%d_ML%d_R%d  (%s)\n', k, H, W, ML, R, reasonStr(k));
+        fprintf('         %s\n         %s\n', redoOpen(k), redoClosed(k));
     end
 
-    % Re-imaging worklist: these pairs could not be measured reliably.
-    % Re-image them (matched illumination/focus, no stage move between the
-    % open and closed shots) and rerun; cached SAM masks make reruns fast.
-    Tredo = Tresults(discIdx, {'Height_layers','Width_px','MembraneLayers','Replicate', ...
-        'OpenFile','ClosedFile','Notes'});
-    redoFile = fullfile(outputDir, 'discarded_reimage_worklist.csv');
+    Tredo = table( ...
+        Tresults.Height_layers(redoIdx), Tresults.Width_px(redoIdx), ...
+        Tresults.MembraneLayers(redoIdx), Tresults.Replicate(redoIdx), ...
+        reasonStr, redoOpen, redoClosed, ...
+        'VariableNames', {'Height_layers','Width_px','MembraneLayers','Replicate', ...
+                          'Reason','RedoOpenFilename','RedoClosedFilename'});
+    redoFile = fullfile(outputDir, 'reimage_worklist.csv');
     writetable(Tredo, redoFile);
-    fprintf('\n  Re-imaging worklist (%d pairs) saved to:\n  %s\n', height(Tredo), redoFile);
+    fprintf('\n  Task list (%d pair(s)) saved to:\n    %s\n', height(Tredo), redoFile);
 end
 
 %% COMPLETION NOTIFICATION
@@ -975,22 +1040,27 @@ end
 
 function meta = parseValveFilename(fname)
 % Parses printability cutout filenames of the form
-%   Cutouts_H5_W20_ML1_R1_CL.jpg            (dateless, legacy)
-%   Cutouts_H5_W20_ML1_R1_CL_021226.jpg     (with experiment date MMDDYY)
-% The trailing _MMDDYY date is OPTIONAL: it is recorded for provenance
-% (meta.Date) but does NOT affect H/W/ML/R/State grouping, so legacy and
-% dated files coexist. Date sourced from the student's log else the image
-% creation date at ingestion time (see merge_new_cutouts.py).
+%   Cutouts_H5_W20_ML1_R1_CL.jpg               (dateless, legacy)
+%   Cutouts_H5_W20_ML1_R1_CL_021226.jpg        (with experiment date MMDDYY)
+%   Cutouts_H5_W20_ML1_R1_CL_071026_redo.jpg   (re-imaged replicate, redo #1)
+%   Cutouts_H5_W20_ML1_R1_CL_071026_redo2.jpg  (re-imaged again, redo #2)
+% The trailing _MMDDYY date and the _redo[N] tag are OPTIONAL. The date is
+% recorded for provenance (meta.Date); the redo rank (meta.Redo, 0 = original)
+% lets a re-imaged file SUPERSEDE the rejected original for the same
+% H/W/ML/R/State (see the redo de-duplication after parsing). Neither field
+% changes grouping. The functionality naming (H5_W100_ML1_R0_021226, no
+% CL/OP) is intentionally NOT matched, keeping the datasets separate.
 meta.H = NaN;
 meta.W = NaN;
 meta.ML = NaN;
 meta.R = NaN;
 meta.State = '';
 meta.Date = '';
+meta.Redo = 0;
 
 [~, base, ~] = fileparts(fname);
-tok = regexp(base, 'H(\d+)_W(\d+)_ML(\d+)_R(\d+)_(CL|OP)(?:_(\d{6}))?$', ...
-    'tokens', 'once', 'ignorecase');
+tok = regexp(base, ['H(\d+)_W(\d+)_ML(\d+)_R(\d+)_(CL|OP)' ...
+    '(?:_(\d{6}))?(_[Rr]edo\d*)?$'], 'tokens', 'once', 'ignorecase');
 
 if isempty(tok)
     return;
@@ -1003,6 +1073,53 @@ meta.R     = str2double(tok{4});
 meta.State = upper(tok{5});
 if numel(tok) >= 6 && ~isempty(tok{6})
     meta.Date = tok{6};   % raw MMDDYY string, provenance only
+end
+if numel(tok) >= 7 && ~isempty(tok{7})
+    d = regexp(tok{7}, '\d+', 'match', 'once');   % '_redo'->'' ; '_redo2'->'2'
+    if isempty(d)
+        meta.Redo = 1;
+    else
+        meta.Redo = str2double(d);
+    end
+end
+end
+
+function k = mmddyyToSortKey(s)
+% Convert an MMDDYY date string to a chronological sort key (YYYYMMDD).
+% Empty/malformed -> 0 (treated as oldest), so dated files win ties over
+% undated legacy files.
+k = 0;
+if isempty(s) || numel(s) ~= 6
+    return;
+end
+mm = str2double(s(1:2)); dd = str2double(s(3:4)); yy = str2double(s(5:6));
+if any(isnan([mm dd yy]))
+    return;
+end
+k = (2000 + yy) * 10000 + mm * 100 + dd;
+end
+
+function suf = nextRedoSuffix(existingName)
+% Given the filename of the rejected image (which may already be a redo),
+% return the suffix for the NEXT re-image: '_redo' if none yet, '_redo2' if
+% the rejected one was already '_redo', '_redo3' after '_redo2', etc.
+r = 0;
+if ~isempty(existingName)
+    [~, b, ~] = fileparts(char(existingName));
+    tok = regexp(b, '_[Rr]edo(\d*)$', 'tokens', 'once');
+    if ~isempty(tok)
+        if isempty(tok{1})
+            r = 1;
+        else
+            r = str2double(tok{1});
+        end
+    end
+end
+n = r + 1;
+if n == 1
+    suf = '_redo';
+else
+    suf = sprintf('_redo%d', n);
 end
 end
 
