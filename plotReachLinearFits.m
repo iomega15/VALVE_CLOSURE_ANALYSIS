@@ -40,11 +40,32 @@ good = (strcmp(string(T.Notes), "OK") | ...
     & ~isnan(T.MaxDownwardReach_pct);
 
 T_clean = T(good, :);
-% Bound at the printability upper limit: beyond ~120 printer px the channel
-% roof pre-sags and reach has no valid open-state baseline (see
-% plotCombinedClosureReach). These widths are excluded from the k fits too.
-maxWidth_px = 120;
-T_clean = T_clean(T_clean.Width_px <= maxWidth_px, :);
+% Trailing non-functional trim (data-driven; see plotCombinedClosureReach for
+% the rationale). Within each (Height, MembraneLayers) series, drop the
+% trailing run of widths that never actuate (reach ~ 0, open == closed past
+% the printability limit) while keeping genuine narrow-width low-reach points.
+% The rising-regime selection below further restricts which of the remaining
+% widths enter the fit; this trim only removes the misleading trailing zeros.
+reachEps = 1.0;
+keepRow  = true(height(T_clean), 1);
+combos   = unique(T_clean(:, {'Height_layers','MembraneLayers'}), 'rows');
+for cc = 1:height(combos)
+    sel = T_clean.Height_layers == combos.Height_layers(cc) & ...
+          T_clean.MembraneLayers == combos.MembraneLayers(cc);
+    ws  = sort(unique(T_clean.Width_px(sel)));
+    isFunc = false(numel(ws), 1);
+    for wi = 1:numel(ws)
+        wsel = sel & T_clean.Width_px == ws(wi);
+        isFunc(wi) = any(T_clean.MaxDownwardReach_pct(wsel) > reachEps);
+    end
+    lastFunc = find(isFunc, 1, 'last');
+    if isempty(lastFunc) || lastFunc == numel(ws)
+        continue;
+    end
+    droppedW = ws(lastFunc+1:end);
+    keepRow(sel & ismember(T_clean.Width_px, droppedW)) = false;
+end
+T_clean = T_clean(keepRow, :);
 if isempty(T_clean)
     warning('No valid rows for linear fits. Skipping.');
     return;

@@ -17,14 +17,43 @@ good = (strcmp(string(T.Notes), "OK") | ...
 
 T_clean = T(good, :);
 
-% Bound the closure analysis at the printability upper limit (Stage I,
-% ~120 printer px / 3800 um for NanoClear). Beyond this the channel roof
-% pre-sags, so the "open" lumen is already collapsed and membrane reach has
-% no valid open-state baseline (e.g. H5_W150 measures ~0 reach because the
-% open and closed cross-sections are indistinguishable). Change or set to
-% Inf to include all widths.
-maxWidth_px = 120;
-T_clean = T_clean(T_clean.Width_px <= maxWidth_px, :);
+% --- Trailing non-functional trim (data-driven, NOT a fixed width cap) ---
+% Within each (Height, MembraneLayers) series, a channel width is
+% "functional" if at least one trustworthy replicate shows non-zero membrane
+% reach (i.e. the valve actually actuates). Past the printability limit the
+% roof pre-sags: the "open" lumen is already collapsed, so open == closed and
+% reach == 0. These non-functional widths are removed ONLY when they form a
+% trailing run at the WIDE end of a series (occurring after the last
+% functional width). Genuine low-reach points at the NARROW end -- where the
+% membrane simply does not span far enough to close yet -- are KEPT, because
+% they precede functional widths. This encodes the logical rule "do not plot
+% a failed point that follows functional points", so the printability bound
+% is discovered from the data (and can extend as 100-150 px data accrue)
+% rather than being hardwired. The dropped widths are reported so their
+% absence can be explained in the text.
+reachEps = 1.0;   % percent; at/below this a group is treated as non-actuating
+keepRow  = true(height(T_clean), 1);
+combos   = unique(T_clean(:, {'Height_layers','MembraneLayers'}), 'rows');
+for cc = 1:height(combos)
+    sel = T_clean.Height_layers == combos.Height_layers(cc) & ...
+          T_clean.MembraneLayers == combos.MembraneLayers(cc);
+    ws  = sort(unique(T_clean.Width_px(sel)));
+    isFunc = false(numel(ws), 1);
+    for wi = 1:numel(ws)
+        wsel = sel & T_clean.Width_px == ws(wi);
+        isFunc(wi) = any(T_clean.MaxDownwardReach_pct(wsel) > reachEps);
+    end
+    lastFunc = find(isFunc, 1, 'last');
+    if isempty(lastFunc) || lastFunc == numel(ws)
+        continue;   % no functional widths, or nothing trailing to trim
+    end
+    droppedW = ws(lastFunc+1:end);
+    keepRow(sel & ismember(T_clean.Width_px, droppedW)) = false;
+    fprintf(['  Closure plot: trimmed trailing non-functional width(s) for ' ...
+             'H=%d ML=%d: %s px (reach~0, open==closed; past printability limit).\n'], ...
+        combos.Height_layers(cc), combos.MembraneLayers(cc), mat2str(droppedW'));
+end
+T_clean = T_clean(keepRow, :);
 
 if isempty(T_clean) || height(T_clean) == 0
     warning('No valid rows for combined plot. Skipping.');
