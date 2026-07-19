@@ -148,7 +148,8 @@ parsed = struct( ...
     'Width_px', [], ...
     'MembraneLayers', [], ...
     'Replicate', [], ...
-    'State', [] );
+    'State', [], ...
+    'ExpDate', [] );
 
 P = repmat(parsed, numel(fileNames), 1);
 
@@ -165,6 +166,7 @@ for i = 1:numel(fileNames)
     P(i).MembraneLayers  = meta.ML;
     P(i).Replicate       = meta.R;
     P(i).State           = meta.State;
+    P(i).ExpDate         = meta.Date;   % '' if undated (legacy), MMDDYY if present
 end
 
 validRows = ~isnan([P.Height_layers])' & ...
@@ -972,14 +974,23 @@ end
 % =========================================================================
 
 function meta = parseValveFilename(fname)
+% Parses printability cutout filenames of the form
+%   Cutouts_H5_W20_ML1_R1_CL.jpg            (dateless, legacy)
+%   Cutouts_H5_W20_ML1_R1_CL_021226.jpg     (with experiment date MMDDYY)
+% The trailing _MMDDYY date is OPTIONAL: it is recorded for provenance
+% (meta.Date) but does NOT affect H/W/ML/R/State grouping, so legacy and
+% dated files coexist. Date sourced from the student's log else the image
+% creation date at ingestion time (see merge_new_cutouts.py).
 meta.H = NaN;
 meta.W = NaN;
 meta.ML = NaN;
 meta.R = NaN;
 meta.State = '';
+meta.Date = '';
 
 [~, base, ~] = fileparts(fname);
-tok = regexp(base, 'H(\d+)_W(\d+)_ML(\d+)_R(\d+)_(CL|OP)$', 'tokens', 'once', 'ignorecase');
+tok = regexp(base, 'H(\d+)_W(\d+)_ML(\d+)_R(\d+)_(CL|OP)(?:_(\d{6}))?$', ...
+    'tokens', 'once', 'ignorecase');
 
 if isempty(tok)
     return;
@@ -990,6 +1001,9 @@ meta.W     = str2double(tok{2});
 meta.ML    = str2double(tok{3});
 meta.R     = str2double(tok{4});
 meta.State = upper(tok{5});
+if numel(tok) >= 6 && ~isempty(tok{6})
+    meta.Date = tok{6};   % raw MMDDYY string, provenance only
+end
 end
 
 function [IclosedReg, tform] = registerClosedToOpen(IopenRGB, IclosedRGB, roi, maxShift_px)
