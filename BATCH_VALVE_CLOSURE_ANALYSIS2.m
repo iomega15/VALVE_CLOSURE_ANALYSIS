@@ -1005,16 +1005,21 @@ end
 %   https://myaccount.google.com/apppasswords   (requires 2-Step Verification)
 % and save it (just the 16 characters) into:
 %   %USERPROFILE%\gmail_app_password.txt
-% The file stays local to that machine (NOT in Dropbox/git). If the file is
-% missing, falls back to an anonymous ntfy.sh push: watch the topic at
-% https://ntfy.sh/rvoronov-valve-2026 in any browser tab or the ntfy app.
-notifyAddr = 'bopohob@gmail.com';
+% The file stays local to that machine (NOT in Dropbox/git). The address comes
+% from the environment variable VALVE_NOTIFY_EMAIL. If the password file or
+% the address is missing, falls back to an anonymous ntfy.sh push to the topic
+% in VALVE_NTFY_TOPIC (watch https://ntfy.sh/<topic> in a browser or the ntfy
+% app). With neither variable set, no notification is sent.
+notifyAddr = getenv('VALVE_NOTIFY_EMAIL');
+ntfyTopic  = getenv('VALVE_NTFY_TOPIC');
 notifyMsg  = sprintf('Valve batch complete: %d rows, %d OK (%d zero-reach), %d QC-discarded, %d failed.', ...
     height(Tresults), nOK, nZero, nDiscard, nOtherFail + nSAMfail);
 
 try
     pwFile = fullfile(getenv('USERPROFILE'), 'gmail_app_password.txt');
-    if exist(pwFile, 'file')
+    if isempty(notifyAddr) && isempty(ntfyTopic)
+        fprintf('\nNo VALVE_NOTIFY_EMAIL or VALVE_NTFY_TOPIC set -> no completion notification.\n');
+    elseif ~isempty(notifyAddr) && exist(pwFile, 'file')
         gmailAppPassword = strtrim(fileread(pwFile));
         setpref('Internet', 'SMTP_Server',   'smtp.gmail.com');
         setpref('Internet', 'E_mail',        notifyAddr);
@@ -1026,9 +1031,11 @@ try
         props.setProperty('mail.smtp.socketFactory.class', 'javax.net.ssl.SSLSocketFactory');
         sendmail(notifyAddr, 'BATCH_VALVE_CLOSURE done', notifyMsg);
         fprintf('\nCompletion email sent to %s.\n', notifyAddr);
+    elseif ~isempty(ntfyTopic)
+        system(sprintf('curl -s -d "%s" https://ntfy.sh/%s', notifyMsg, ntfyTopic));
+        fprintf('\nPush sent to https://ntfy.sh/%s.\n', ntfyTopic);
     else
-        system(sprintf('curl -s -d "%s" https://ntfy.sh/rvoronov-valve-2026', notifyMsg));
-        fprintf('\nNo %s found -> push sent to https://ntfy.sh/rvoronov-valve-2026 instead.\n', pwFile);
+        fprintf('\nNo %s found and no VALVE_NTFY_TOPIC set -> no completion notification.\n', pwFile);
     end
 catch MEnotify
     warning('Completion notification failed: %s', MEnotify.message);
